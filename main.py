@@ -163,7 +163,7 @@ PAGE_DELAY_SECONDS = float(os.environ.get("PAGE_DELAY_SECONDS", "2"))
 # How long to wait before retrying after an HTTP 429 (rate limit) response.
 RATE_LIMIT_SLEEP_SECONDS = int(os.environ.get("RATE_LIMIT_SLEEP_SECONDS", "60"))
 
-MAX_ARTICLES_PER_EXAM = 100
+MAX_ARTICLES_PER_EXAM = 100000
 FIREBASE_ROOT_NODE = "current_affairs"
 
 ALL_EXAMS_NODE = "All Exams"
