@@ -32,7 +32,10 @@ jobs:
 
       - name: Run current affairs automation
         env:
-          NEWSDATA_API_KEY: ${{ secrets.NEWSDATA_API_KEY }}
+          NEWSDATA_API_KEY_1: ${{ secrets.NEWSDATA_API_KEY_1 }}
+          NEWSDATA_API_KEY_2: ${{ secrets.NEWSDATA_API_KEY_2 }}
+          NEWSDATA_API_KEY_3: ${{ secrets.NEWSDATA_API_KEY_3 }}
+          NEWSDATA_API_KEY_4: ${{ secrets.NEWSDATA_API_KEY_4 }}
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
           MEDIASTACK_API_KEY: ${{ secrets.MEDIASTACK_API_KEY }}
           THENEWS_API_KEY: ${{ secrets.THENEWS_API_KEY }}
