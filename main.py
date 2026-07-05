@@ -4,17 +4,32 @@
 ExamHub India Current Affairs Automation
 ==========================================
 
-Fetches India's latest current affairs from NewsData.io, filters out
-irrelevant/junk content, removes duplicates, generates short summaries,
-extracts important keywords, maps each article to every relevant
-competitive exam, and uploads everything to Firebase Realtime Database.
+Fetches India's latest current affairs from multiple news APIs (with
+automatic failover), filters out irrelevant/junk content, removes
+duplicates, generates short summaries, extracts important keywords, maps
+each article to every relevant competitive exam, and uploads everything to
+Firebase Realtime Database.
 
-Designed to run as a scheduled GitHub Action, but works fine locally too
-as long as the three required environment variables are set:
+Designed to run as a scheduled GitHub Action, but works fine locally too.
 
-    NEWSDATA_API_KEY
+Required environment variables:
+
     FIREBASE_SERVICE_ACCOUNT   (raw JSON string of the service account key)
     FIREBASE_DATABASE_URL
+
+At least ONE of the following news API keys is required (more is better,
+since it enables automatic failover if one source hits its rate limit):
+
+    NEWSDATA_API_KEY      (primary source, supports pagination)
+    GNEWS_API_KEY         (fallback source)
+    MEDIASTACK_API_KEY    (fallback source)
+    THENEWS_API_KEY       (fallback source)
+
+Optional tuning variables:
+
+    MAX_ARTICLES_PER_CATEGORY   (default: 150)
+    PAGE_DELAY_SECONDS          (default: 2)
+    RATE_LIMIT_SLEEP_SECONDS    (default: 60)
 
 Author: ExamHub India
 """
@@ -59,10 +74,17 @@ logger = logging.getLogger("ExamHub")
 # ======================================================================
 
 NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "").strip()
+GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "").strip()
+MEDIASTACK_API_KEY = os.environ.get("MEDIASTACK_API_KEY", "").strip()
+THENEWS_API_KEY = os.environ.get("THENEWS_API_KEY", "").strip()
+
 FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
 FIREBASE_DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "").strip()
 
 NEWSDATA_BASE_URL = "https://newsdata.io/api/1/news"
+GNEWS_BASE_URL = "https://gnews.io/api/v4/top-headlines"
+MEDIASTACK_BASE_URL = "http://api.mediastack.com/v1/news"
+THENEWSAPI_BASE_URL = "https://api.thenewsapi.com/v1/news/top"
 
 NEWS_CATEGORIES = [
     "top",
@@ -75,12 +97,61 @@ NEWS_CATEGORIES = [
     "world",
 ]
 
+# Each fallback source uses different category names than NewsData.io.
+# These maps translate our canonical category into each source's own
+# vocabulary. Categories with no real equivalent fall back to a sensible
+# default (e.g. "general").
+GNEWS_CATEGORY_MAP: Dict[str, str] = {
+    "top": "general",
+    "politics": "nation",
+    "business": "business",
+    "science": "science",
+    "technology": "technology",
+    "education": "nation",
+    "sports": "sports",
+    "world": "world",
+}
+
+MEDIASTACK_CATEGORY_MAP: Dict[str, str] = {
+    "top": "general",
+    "politics": "general",
+    "business": "business",
+    "science": "science",
+    "technology": "technology",
+    "education": "general",
+    "sports": "sports",
+    "world": "general",
+}
+
+THENEWSAPI_CATEGORY_MAP: Dict[str, str] = {
+    "top": "general",
+    "politics": "politics",
+    "business": "business",
+    "science": "science",
+    "technology": "tech",
+    "education": "general",
+    "sports": "sports",
+    "world": "general",
+}
+
 COUNTRY = "in"
 LANGUAGE = "en"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 4
 REQUEST_TIMEOUT_SECONDS = 20
+
+# How many articles to try to collect per category before stopping.
+# Configurable via env var so it can be tuned down for free-tier API plans
+# without touching code. NewsData.io free plan works best around 100-150.
+MAX_FETCH_PER_CATEGORY = int(os.environ.get("MAX_ARTICLES_PER_CATEGORY", "150"))
+
+# Small pause between paginated requests to the same API, to stay well
+# under per-second/per-minute rate limits.
+PAGE_DELAY_SECONDS = float(os.environ.get("PAGE_DELAY_SECONDS", "2"))
+
+# How long to wait before retrying after an HTTP 429 (rate limit) response.
+RATE_LIMIT_SLEEP_SECONDS = int(os.environ.get("RATE_LIMIT_SLEEP_SECONDS", "60"))
 
 MAX_ARTICLES_PER_EXAM = 100
 FIREBASE_ROOT_NODE = "current_affairs"
@@ -226,12 +297,24 @@ BLOCKLIST_KEYWORDS: List[str] = [
 
 
 # ======================================================================
+# CUSTOM EXCEPTIONS
+# ======================================================================
+
+class RateLimitError(Exception):
+    """Raised when a news API responds with HTTP 429 (rate limit reached).
+    Handled specially by the retry decorator, which waits much longer
+    before retrying than it would for a generic failure."""
+
+
+# ======================================================================
 # RETRY DECORATOR
 # ======================================================================
 
 def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_SECONDS):
-    """Retry a function on failure with linear backoff. Never raises past
-    the final attempt is swallowed by the caller if it also wraps in try/except."""
+    """Retry a function on failure with linear backoff. Rate-limit errors
+    (HTTP 429) get a much longer, fixed sleep since retrying quickly after
+    a rate limit almost always fails again. Never raises past the final
+    attempt is swallowed by the caller if it also wraps in try/except."""
 
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -239,6 +322,21 @@ def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
+                except RateLimitError as exc:
+                    last_exception = exc
+                    logger.warning(
+                        "Rate limit hit on attempt %d/%d for %s: %s",
+                        attempt,
+                        max_attempts,
+                        func.__name__,
+                        exc,
+                    )
+                    if attempt < max_attempts:
+                        logger.info(
+                            "Sleeping %d seconds before retrying due to rate limit...",
+                            RATE_LIMIT_SLEEP_SECONDS,
+                        )
+                        time.sleep(RATE_LIMIT_SLEEP_SECONDS)
                 except Exception as exc:  # noqa: BLE001 - intentional broad catch
                     last_exception = exc
                     logger.warning(
@@ -284,7 +382,7 @@ class NewsDataFetcher:
         )
 
         if response.status_code == 429:
-            raise RuntimeError("NewsData.io rate limit reached (HTTP 429)")
+            raise RateLimitError("NewsData.io rate limit reached (HTTP 429)")
         if response.status_code != 200:
             raise RuntimeError(
                 f"NewsData.io returned HTTP {response.status_code}: {response.text[:200]}"
@@ -304,13 +402,15 @@ class NewsDataFetcher:
         return data
 
     def fetch_category(self, category: str) -> List[Dict[str, Any]]:
-        """Fetch a category's articles across multiple pages (up to 300
-        articles) using NewsData.io's nextPage cursor, stopping early if
-        results run out or no further page is available."""
+        """Fetch a category's articles across multiple pages (up to
+        MAX_FETCH_PER_CATEGORY articles) using NewsData.io's nextPage
+        cursor, stopping early if results run out or no further page is
+        available. A short delay is added between pages to stay well
+        under NewsData.io's rate limits."""
         articles: List[Dict[str, Any]] = []
         page = None
 
-        while len(articles) < 300:
+        while len(articles) < MAX_FETCH_PER_CATEGORY:
             try:
                 data = self._fetch_page(category, page)
             except Exception as exc:  # noqa: BLE001
@@ -324,11 +424,283 @@ class NewsDataFetcher:
             articles.extend(results)
 
             page = data.get("nextPage")
+
+            time.sleep(PAGE_DELAY_SECONDS)
+
             if not page:
                 break
 
         logger.info("Fetched %d raw articles for category '%s'", len(articles), category)
         return articles
+
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        all_articles: List[Dict[str, Any]] = []
+        for category in NEWS_CATEGORIES:
+            all_articles.extend(self.fetch_category(category))
+        return all_articles
+
+
+# ======================================================================
+# FALLBACK NEWS FETCHERS (GNews, Mediastack, TheNewsAPI)
+# ======================================================================
+#
+# These sources are used automatically when NewsData.io fails or hits its
+# rate limit. Each fetcher normalizes its own API's response into the
+# same field names NewsData.io uses (title, description, content, link,
+# image_url, pubDate, source_id, category) so the rest of the pipeline
+# (build_article_record, etc.) does not need to know which source an
+# article came from.
+# ======================================================================
+
+class GNewsFetcher:
+    """Handles communication with the GNews API (https://gnews.io)."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @retry()
+    def _fetch(self, category: str) -> Dict[str, Any]:
+        params = {
+            "apikey": self.api_key,
+            "country": COUNTRY,
+            "lang": LANGUAGE,
+            "category": category,
+            "max": 25,
+        }
+        response = requests.get(GNEWS_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+
+        if response.status_code == 429:
+            raise RateLimitError("GNews rate limit reached (HTTP 429)")
+        if response.status_code != 200:
+            raise RuntimeError(f"GNews returned HTTP {response.status_code}: {response.text[:200]}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON received from GNews: {exc}") from exc
+
+        if not data:
+            raise RuntimeError("Empty response body from GNews")
+
+        return data
+
+    @staticmethod
+    def _normalize(article: Dict[str, Any], category: str) -> Optional[Dict[str, Any]]:
+        if not article.get("title") or not article.get("url"):
+            return None
+        source = article.get("source") or {}
+        return {
+            "title": article.get("title") or "",
+            "description": article.get("description") or "",
+            "content": article.get("content") or "",
+            "link": article.get("url") or "",
+            "image_url": article.get("image") or "",
+            "pubDate": article.get("publishedAt") or "",
+            "source_id": source.get("name") or "GNews",
+            "category": [category],
+        }
+
+    def fetch_category(self, category: str) -> List[Dict[str, Any]]:
+        try:
+            data = self._fetch(category)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("GNews failed for category '%s' after retries: %s", category, exc)
+            return []
+
+        raw_articles = data.get("articles") or []
+        normalized = [self._normalize(a, category) for a in raw_articles]
+        articles = [a for a in normalized if a]
+        logger.info("Fetched %d raw articles from GNews for category '%s'", len(articles), category)
+        return articles
+
+
+class MediastackFetcher:
+    """Handles communication with the Mediastack API (https://mediastack.com)."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @retry()
+    def _fetch(self, category: str) -> Dict[str, Any]:
+        params = {
+            "access_key": self.api_key,
+            "countries": COUNTRY,
+            "languages": LANGUAGE,
+            "categories": category,
+            "limit": 100,
+        }
+        response = requests.get(MEDIASTACK_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+
+        if response.status_code == 429:
+            raise RateLimitError("Mediastack rate limit reached (HTTP 429)")
+        if response.status_code != 200:
+            raise RuntimeError(f"Mediastack returned HTTP {response.status_code}: {response.text[:200]}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON received from Mediastack: {exc}") from exc
+
+        if not data:
+            raise RuntimeError("Empty response body from Mediastack")
+
+        if "error" in data:
+            raise RuntimeError(f"Mediastack API error: {data.get('error')}")
+
+        return data
+
+    @staticmethod
+    def _normalize(article: Dict[str, Any], category: str) -> Optional[Dict[str, Any]]:
+        if not article.get("title") or not article.get("url"):
+            return None
+        return {
+            "title": article.get("title") or "",
+            "description": article.get("description") or "",
+            "content": article.get("description") or "",
+            "link": article.get("url") or "",
+            "image_url": article.get("image") or "",
+            "pubDate": article.get("published_at") or "",
+            "source_id": article.get("source") or "Mediastack",
+            "category": [category],
+        }
+
+    def fetch_category(self, category: str) -> List[Dict[str, Any]]:
+        try:
+            data = self._fetch(category)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Mediastack failed for category '%s' after retries: %s", category, exc)
+            return []
+
+        raw_articles = data.get("data") or []
+        normalized = [self._normalize(a, category) for a in raw_articles]
+        articles = [a for a in normalized if a]
+        logger.info("Fetched %d raw articles from Mediastack for category '%s'", len(articles), category)
+        return articles
+
+
+class TheNewsAPIFetcher:
+    """Handles communication with TheNewsAPI (https://www.thenewsapi.com)."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @retry()
+    def _fetch(self, category: str) -> Dict[str, Any]:
+        params = {
+            "api_token": self.api_key,
+            "locale": COUNTRY,
+            "language": LANGUAGE,
+            "categories": category,
+            "limit": 25,
+        }
+        response = requests.get(THENEWSAPI_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+
+        if response.status_code == 429:
+            raise RateLimitError("TheNewsAPI rate limit reached (HTTP 429)")
+        if response.status_code != 200:
+            raise RuntimeError(f"TheNewsAPI returned HTTP {response.status_code}: {response.text[:200]}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON received from TheNewsAPI: {exc}") from exc
+
+        if not data:
+            raise RuntimeError("Empty response body from TheNewsAPI")
+
+        if "error" in data:
+            raise RuntimeError(f"TheNewsAPI error: {data.get('error')}")
+
+        return data
+
+    @staticmethod
+    def _normalize(article: Dict[str, Any], category: str) -> Optional[Dict[str, Any]]:
+        if not article.get("title") or not article.get("url"):
+            return None
+        return {
+            "title": article.get("title") or "",
+            "description": article.get("description") or article.get("snippet") or "",
+            "content": article.get("snippet") or article.get("description") or "",
+            "link": article.get("url") or "",
+            "image_url": article.get("image_url") or "",
+            "pubDate": article.get("published_at") or "",
+            "source_id": article.get("source") or "TheNewsAPI",
+            "category": [category],
+        }
+
+    def fetch_category(self, category: str) -> List[Dict[str, Any]]:
+        try:
+            data = self._fetch(category)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("TheNewsAPI failed for category '%s' after retries: %s", category, exc)
+            return []
+
+        raw_articles = data.get("data") or []
+        normalized = [self._normalize(a, category) for a in raw_articles]
+        articles = [a for a in normalized if a]
+        logger.info("Fetched %d raw articles from TheNewsAPI for category '%s'", len(articles), category)
+        return articles
+
+
+# ======================================================================
+# MULTI-SOURCE FETCHER (AUTOMATIC FAILOVER)
+# ======================================================================
+
+class MultiSourceFetcher:
+    """Orchestrates all configured news sources, trying them in priority
+    order for each category: NewsData.io -> GNews -> Mediastack ->
+    TheNewsAPI. If a source fails, hits its rate limit, or returns no
+    articles, the next configured source is automatically tried instead.
+    Only sources with an API key present in the environment are used."""
+
+    def __init__(self):
+        # Each entry: (source_name, fetcher_instance, category_map_or_None)
+        self.sources: List[tuple] = []
+
+        if NEWSDATA_API_KEY:
+            self.sources.append(("NewsData.io", NewsDataFetcher(NEWSDATA_API_KEY), None))
+        if GNEWS_API_KEY:
+            self.sources.append(("GNews", GNewsFetcher(GNEWS_API_KEY), GNEWS_CATEGORY_MAP))
+        if MEDIASTACK_API_KEY:
+            self.sources.append(("Mediastack", MediastackFetcher(MEDIASTACK_API_KEY), MEDIASTACK_CATEGORY_MAP))
+        if THENEWS_API_KEY:
+            self.sources.append(("TheNewsAPI", TheNewsAPIFetcher(THENEWS_API_KEY), THENEWSAPI_CATEGORY_MAP))
+
+        if not self.sources:
+            logger.error(
+                "No news API keys configured. Set at least one of "
+                "NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY."
+            )
+        else:
+            configured_names = ", ".join(name for name, _, _ in self.sources)
+            logger.info("News sources configured (priority order): %s", configured_names)
+
+    def fetch_category(self, category: str) -> List[Dict[str, Any]]:
+        for name, fetcher, category_map in self.sources:
+            source_category = category_map.get(category, category) if category_map else category
+            try:
+                articles = fetcher.fetch_category(source_category)
+            except Exception as exc:  # noqa: BLE001 - a source must never crash the run
+                logger.error(
+                    "Source '%s' raised an unexpected error for category '%s': %s",
+                    name, category, exc,
+                )
+                articles = []
+
+            if articles:
+                logger.info(
+                    "Using source '%s' for category '%s' (%d articles).",
+                    name, category, len(articles),
+                )
+                return articles
+
+            logger.warning(
+                "Source '%s' returned no articles for category '%s'; trying next source.",
+                name, category,
+            )
+
+        logger.error("All configured sources failed for category '%s'.", category)
+        return []
 
     def fetch_all(self) -> List[Dict[str, Any]]:
         all_articles: List[Dict[str, Any]] = []
@@ -687,8 +1059,6 @@ class FirebaseUploader:
 
 def validate_environment() -> bool:
     missing = []
-    if not NEWSDATA_API_KEY:
-        missing.append("NEWSDATA_API_KEY")
     if not FIREBASE_SERVICE_ACCOUNT:
         missing.append("FIREBASE_SERVICE_ACCOUNT")
     if not FIREBASE_DATABASE_URL:
@@ -697,6 +1067,14 @@ def validate_environment() -> bool:
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         return False
+
+    if not any([NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY]):
+        logger.error(
+            "At least one news API key is required: "
+            "NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, or THENEWS_API_KEY."
+        )
+        return False
+
     return True
 
 
@@ -722,7 +1100,7 @@ def main() -> None:
 
     # ---------------- STEP 1: FETCH ----------------
     try:
-        fetcher = NewsDataFetcher(NEWSDATA_API_KEY)
+        fetcher = MultiSourceFetcher()
         raw_articles = fetcher.fetch_all()
         stats["fetched"] = len(raw_articles)
         logger.info("STEP 1 COMPLETE: Fetched %d total raw articles.", stats["fetched"])
