@@ -20,7 +20,10 @@ Required environment variables:
 At least ONE of the following news API keys is required (more is better,
 since it enables automatic failover if one source hits its rate limit):
 
-    NEWSDATA_API_KEY      (primary source, supports pagination)
+    NEWSDATA_API_KEY_1    (primary source, supports pagination + rotation)
+    NEWSDATA_API_KEY_2    (extra NewsData.io key, auto-rotated on 429)
+    NEWSDATA_API_KEY_3    (extra NewsData.io key, auto-rotated on 429)
+    NEWSDATA_API_KEY_4    (extra NewsData.io key, auto-rotated on 429)
     GNEWS_API_KEY         (fallback source)
     MEDIASTACK_API_KEY    (fallback source)
     THENEWS_API_KEY       (fallback source)
@@ -73,7 +76,14 @@ logger = logging.getLogger("ExamHub")
 # CONFIGURATION
 # ======================================================================
 
-NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "").strip()
+NEWSDATA_API_KEYS = [
+    os.environ.get("NEWSDATA_API_KEY_1", "").strip(),
+    os.environ.get("NEWSDATA_API_KEY_2", "").strip(),
+    os.environ.get("NEWSDATA_API_KEY_3", "").strip(),
+    os.environ.get("NEWSDATA_API_KEY_4", "").strip(),
+]
+NEWSDATA_API_KEYS = [k for k in NEWSDATA_API_KEYS if k]
+
 GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "").strip()
 MEDIASTACK_API_KEY = os.environ.get("MEDIASTACK_API_KEY", "").strip()
 THENEWS_API_KEY = os.environ.get("THENEWS_API_KEY", "").strip()
@@ -310,11 +320,20 @@ class RateLimitError(Exception):
 # RETRY DECORATOR
 # ======================================================================
 
-def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_SECONDS):
+def retry(
+    max_attempts: int = MAX_RETRIES,
+    backoff_seconds: int = RETRY_BACKOFF_SECONDS,
+    retry_on_rate_limit: bool = True,
+):
     """Retry a function on failure with linear backoff. Rate-limit errors
     (HTTP 429) get a much longer, fixed sleep since retrying quickly after
     a rate limit almost always fails again. Never raises past the final
-    attempt is swallowed by the caller if it also wraps in try/except."""
+    attempt is swallowed by the caller if it also wraps in try/except.
+
+    If retry_on_rate_limit is False, a RateLimitError is raised straight
+    away on the first attempt (no sleep, no retry loop). This is used by
+    fetchers that have their own faster recovery strategy for 429s, such
+    as switching to a different API key instead of waiting."""
 
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -323,6 +342,8 @@ def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_
                 try:
                     return func(*args, **kwargs)
                 except RateLimitError as exc:
+                    if not retry_on_rate_limit:
+                        raise
                     last_exception = exc
                     logger.warning(
                         "Rate limit hit on attempt %d/%d for %s: %s",
@@ -361,13 +382,38 @@ def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_
 # ======================================================================
 
 class NewsDataFetcher:
-    """Handles all communication with the NewsData.io API."""
+    """Handles all communication with the NewsData.io API, with automatic
+    multi-key rotation. Instead of retrying the SAME rate-limited key
+    (which almost always fails again), a 429 immediately switches to the
+    next configured NEWSDATA_API_KEY_* and retries the request right
+    away. All non-429 errors still use the normal retry/backoff logic
+    on whichever key is currently active."""
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    def __init__(self, api_keys: List[str]):
+        self.api_keys = [k for k in api_keys if k]
+        if not self.api_keys:
+            raise ValueError("NewsDataFetcher requires at least one API key")
+        self.key_index = 0
 
-    @retry()
-    def _fetch_page(self, category: str, page_token: Optional[str] = None) -> Dict[str, Any]:
+    @property
+    def api_key(self) -> str:
+        return self.api_keys[self.key_index]
+
+    def _rotate_to_next_key(self) -> bool:
+        """Advance to the next API key. Returns True if a fresh key is
+        now active, or False if every key has already been tried."""
+        if self.key_index + 1 < len(self.api_keys):
+            self.key_index += 1
+            logger.warning(
+                "NewsData.io: switching to backup API key #%d of %d after rate limit.",
+                self.key_index + 1,
+                len(self.api_keys),
+            )
+            return True
+        return False
+
+    @retry(retry_on_rate_limit=False)
+    def _request_page(self, category: str, page_token: Optional[str]) -> Dict[str, Any]:
         params = {
             "apikey": self.api_key,
             "country": COUNTRY,
@@ -400,6 +446,30 @@ class NewsDataFetcher:
             raise RuntimeError(f"NewsData.io API error: {data.get('results', data)}")
 
         return data
+
+    def _fetch_page(self, category: str, page_token: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch one page, rotating to the next key immediately whenever
+        the currently active key comes back rate limited. Only raises
+        once every configured key has been tried and failed."""
+        keys_tried = 0
+        last_exception: Optional[Exception] = None
+
+        while keys_tried < len(self.api_keys):
+            try:
+                return self._request_page(category, page_token)
+            except RateLimitError as exc:
+                last_exception = exc
+                keys_tried += 1
+                if not self._rotate_to_next_key():
+                    break
+                # Retry immediately on the new key, no long sleep needed.
+                continue
+
+        logger.error(
+            "NewsData.io: all %d configured API key(s) are rate limited.",
+            len(self.api_keys),
+        )
+        raise last_exception
 
     def fetch_category(self, category: str) -> List[Dict[str, Any]]:
         """Fetch a category's articles across multiple pages (up to
@@ -657,8 +727,8 @@ class MultiSourceFetcher:
         # Each entry: (source_name, fetcher_instance, category_map_or_None)
         self.sources: List[tuple] = []
 
-        if NEWSDATA_API_KEY:
-            self.sources.append(("NewsData.io", NewsDataFetcher(NEWSDATA_API_KEY), None))
+        if NEWSDATA_API_KEYS:
+            self.sources.append(("NewsData.io", NewsDataFetcher(NEWSDATA_API_KEYS), None))
         if GNEWS_API_KEY:
             self.sources.append(("GNews", GNewsFetcher(GNEWS_API_KEY), GNEWS_CATEGORY_MAP))
         if MEDIASTACK_API_KEY:
@@ -669,7 +739,7 @@ class MultiSourceFetcher:
         if not self.sources:
             logger.error(
                 "No news API keys configured. Set at least one of "
-                "NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY."
+                "NEWSDATA_API_KEY_1..4, GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY."
             )
         else:
             configured_names = ", ".join(name for name, _, _ in self.sources)
@@ -1068,10 +1138,10 @@ def validate_environment() -> bool:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         return False
 
-    if not any([NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY]):
+    if not any(NEWSDATA_API_KEYS) and not any([GNEWS_API_KEY, MEDIASTACK_API_KEY, THENEWS_API_KEY]):
         logger.error(
             "At least one news API key is required: "
-            "NEWSDATA_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY, or THENEWS_API_KEY."
+            "NEWSDATA_API_KEY_1..4, GNEWS_API_KEY, MEDIASTACK_API_KEY, or THENEWS_API_KEY."
         )
         return False
 
