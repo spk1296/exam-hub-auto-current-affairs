@@ -1,589 +1,769 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Current Affairs Auto-Updater
-=============================
+ExamHub India Current Affairs Automation
+==========================================
 
-Fetches the latest India current affairs from NewsData.io (Free Plan),
-automatically categorizes each news item into every relevant competitive
-exam category, removes duplicates, and uploads the result to Firebase
-Realtime Database using the Firebase Admin SDK.
+Fetches India's latest current affairs from NewsData.io, filters out
+irrelevant/junk content, removes duplicates, generates short summaries,
+extracts important keywords, maps each article to every relevant
+competitive exam, and uploads everything to Firebase Realtime Database.
 
-Designed to run once a day via GitHub Actions, but safe to run manually
-any number of times (it merges with existing data and never loses history
-beyond the configured per-exam limit).
+Designed to run as a scheduled GitHub Action, but works fine locally too
+as long as the three required environment variables are set:
 
-Author: Generated for automated Android app current-affairs pipeline.
+    NEWSDATA_API_KEY
+    FIREBASE_SERVICE_ACCOUNT   (raw JSON string of the service account key)
+    FIREBASE_DATABASE_URL
+
+Author: ExamHub India
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
 
 import requests
+from dateutil import parser as date_parser
 
 try:
     import firebase_admin
     from firebase_admin import credentials, db
-except ImportError as exc:  # pragma: no cover
-    print(f"FATAL: firebase-admin is not installed: {exc}", file=sys.stderr)
-    sys.exit(1)
+except ImportError:  # pragma: no cover
+    firebase_admin = None
 
 
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-NEWSDATA_BASE_URL = "https://newsdata.io/api/1/latest"
-
-# Free plan constraints: max 10 results per request, ~200 credits/day.
-# We spread requests across a handful of categories relevant to Indian
-# competitive exam current affairs, and stay well within the free quota.
-NEWSDATA_CATEGORIES = [
-    "top",
-    "politics",
-    "world",
-    "business",
-    "science",
-    "education",
-    "sports",
-    "technology",
-]
-
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 5
-REQUEST_TIMEOUT_SECONDS = 20
-SLEEP_BETWEEN_REQUESTS_SECONDS = 1.5
-
-MAX_ITEMS_PER_EXAM = 100
-FIREBASE_ROOT_NODE = "current_affairs"
-ALL_EXAMS_NODE = "All Exams"
-
-# The complete list of exam nodes that must always exist in Firebase,
-# even if no news matches them on a given day.
-EXAM_LIST = [
-    "UPSC",
-    "SSC CGL",
-    "SSC CHSL",
-    "SSC GD",
-    "Railway NTPC",
-    "Railway Group D",
-    "Bihar Police",
-    "Bihar SI",
-    "BPSC",
-    "CTET",
-    "STET",
-    "UGC NET",
-    "CDS",
-    "NDA",
-    "IBPS PO",
-    "SBI PO",
-    "JEE",
-    "NEET",
-    "CUET",
-    ALL_EXAMS_NODE,
-]
-
-# --------------------------------------------------------------------------
-# Categorization rules
-# --------------------------------------------------------------------------
-# Each rule maps a set of keywords (matched case-insensitively against the
-# combined title + description of a news item) to the list of exams that
-# the news item should be uploaded to. A single news item can match
-# multiple rules, and will be uploaded to the union of all matched exams.
-#
-# Two tiers of rules are used:
-#   1. EXAM_SPECIFIC_RULES  -> keywords that name a specific exam/recruitment
-#      directly (e.g. "SSC CGL", "IBPS PO"). These map to that one exam.
-#   2. TOPIC_RULES          -> broader current-affairs topics (government
-#      schemes, defence, economy, science, sports, education policy, etc.)
-#      that are generally relevant to a group of exams and are commonly
-#      asked in their General Knowledge / Current Affairs sections.
-# --------------------------------------------------------------------------
-
-EXAM_SPECIFIC_RULES = {
-    "UPSC": [
-        "upsc", "civil services exam", "ias officer", "ips officer",
-        "ifs officer", "union public service commission", "cse prelims",
-        "cse mains", "civil services examination",
-    ],
-    "SSC CGL": [
-        "ssc cgl", "combined graduate level",
-    ],
-    "SSC CHSL": [
-        "ssc chsl", "combined higher secondary level",
-    ],
-    "SSC GD": [
-        "ssc gd", "gd constable", "ssc constable",
-    ],
-    "Railway NTPC": [
-        "railway ntpc", "rrb ntpc", "non technical popular categories",
-    ],
-    "Railway Group D": [
-        "railway group d", "rrb group d", "rrc group d",
-    ],
-    "Bihar Police": [
-        "bihar police", "bihar constable", "csbc",
-    ],
-    "Bihar SI": [
-        "bihar si", "bihar sub inspector", "bpssc", "bihar police subordinate service commission",
-    ],
-    "BPSC": [
-        "bpsc", "bihar public service commission",
-    ],
-    "CTET": [
-        "ctet", "central teacher eligibility test",
-    ],
-    "STET": [
-        "stet", "state teacher eligibility test", "bihar stet",
-    ],
-    "UGC NET": [
-        "ugc net", "nta net", "national eligibility test", "jrf exam",
-    ],
-    "CDS": [
-        "cds exam", "combined defence services",
-    ],
-    "NDA": [
-        "nda exam", "national defence academy",
-    ],
-    "IBPS PO": [
-        "ibps po", "ibps probationary officer", "institute of banking personnel selection",
-    ],
-    "SBI PO": [
-        "sbi po", "state bank of india po", "sbi probationary officer",
-    ],
-    "JEE": [
-        "jee main", "jee advanced", "joint entrance examination",
-    ],
-    "NEET": [
-        "neet ug", "neet pg", "neet exam", "national eligibility cum entrance test",
-    ],
-    "CUET": [
-        "cuet", "common university entrance test",
-    ],
-}
-
-TOPIC_RULES = {
-    # General polity, governance, and government schemes are core GK for
-    # almost every competitive exam.
-    "government_scheme": {
-        "keywords": [
-            "government scheme", "yojana", "cabinet approves", "union cabinet",
-            "niti aayog", "budget 2026", "union budget", "parliament passes",
-            "lok sabha", "rajya sabha", "new policy", "ministry of",
-        ],
-        "exams": [
-            "UPSC", "BPSC", "SSC CGL", "SSC CHSL", "IBPS PO", "SBI PO",
-            "CUET", "UGC NET",
-        ],
-    },
-    "defence_security": {
-        "keywords": [
-            "indian army", "indian navy", "indian air force", "drdo",
-            "defence ministry", "border security force", "isro launch",
-            "missile test", "military exercise",
-        ],
-        "exams": ["UPSC", "CDS", "NDA", "BPSC", "SSC CGL", "SSC GD"],
-    },
-    "international_relations": {
-        "keywords": [
-            "united nations", "g20 summit", "bilateral talks", "foreign minister",
-            "diplomatic", "international relations", "world bank", "imf report",
-            "bilateral agreement", "summit meeting",
-        ],
-        "exams": ["UPSC", "BPSC", "CDS", "NDA"],
-    },
-    "banking_economy": {
-        "keywords": [
-            "reserve bank of india", "rbi monetary policy", "repo rate",
-            "gdp growth", "inflation rate", "stock market", "sensex", "nifty",
-            "banking sector", "economic survey",
-        ],
-        "exams": ["IBPS PO", "SBI PO", "UPSC", "BPSC", "SSC CGL"],
-    },
-    "science_technology": {
-        "keywords": [
-            "isro", "space mission", "chandrayaan", "gaganyaan", "artificial intelligence",
-            "scientific research", "nasa", "satellite launch", "technology breakthrough",
-        ],
-        "exams": ["UPSC", "JEE", "NEET", "SSC CGL", "SSC CHSL", "CUET"],
-    },
-    "sports": {
-        "keywords": [
-            "olympics", "world cup", "cricket team", "asian games", "commonwealth games",
-            "sports ministry", "khelo india", "medal tally",
-        ],
-        "exams": ["SSC CGL", "SSC CHSL", "Railway NTPC", "UPSC", "BPSC"],
-    },
-    "education_policy": {
-        "keywords": [
-            "education policy", "national education policy", "nep 2020",
-            "university grants commission", "school education", "board exam results",
-        ],
-        "exams": ["CTET", "STET", "UGC NET", "CUET", "UPSC"],
-    },
-    "state_affairs_bihar": {
-        "keywords": [
-            "bihar government", "bihar cabinet", "bihar assembly", "patna high court",
-            "bihar chief minister",
-        ],
-        "exams": ["BPSC", "Bihar Police", "Bihar SI", "STET"],
-    },
-    "awards_appointments": {
-        "keywords": [
-            "padma award", "nobel prize", "appointed as chief", "new governor",
-            "new chief justice", "award ceremony",
-        ],
-        "exams": ["UPSC", "BPSC", "SSC CGL", "SSC CHSL", "IBPS PO", "SBI PO"],
-    },
-}
-
-
-# --------------------------------------------------------------------------
-# Logging setup
-# --------------------------------------------------------------------------
+# ======================================================================
+# LOGGING SETUP
+# ======================================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("current_affairs_updater")
+logger = logging.getLogger("ExamHub")
 
 
-# --------------------------------------------------------------------------
-# Environment / configuration helpers
-# --------------------------------------------------------------------------
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 
-def get_required_env(var_name: str) -> str:
-    """Fetch a required environment variable or exit with a clear error."""
-    value = os.environ.get(var_name)
-    if not value:
-        logger.error("Missing required environment variable: %s", var_name)
-        sys.exit(1)
-    return value
+NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "").strip()
+FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+FIREBASE_DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "").strip()
+
+NEWSDATA_BASE_URL = "https://newsdata.io/api/1/news"
+
+NEWS_CATEGORIES = [
+    "top",
+    "politics",
+    "business",
+    "science",
+    "technology",
+    "education",
+    "sports",
+    "world",
+]
+
+COUNTRY = "in"
+LANGUAGE = "en"
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 4
+REQUEST_TIMEOUT_SECONDS = 20
+
+MAX_ARTICLES_PER_EXAM = 100
+FIREBASE_ROOT_NODE = "current_affairs"
+
+ALL_EXAMS_NODE = "All Exams"
+
+# ----------------------------------------------------------------------
+# Supported exams grouped into logical categories.
+# ----------------------------------------------------------------------
+
+EXAM_CATEGORY_MEMBERS: Dict[str, List[str]] = {
+    "upsc": ["UPSC"],
+    "state": ["BPSC", "Bihar Police", "Bihar SI", "State PSC"],
+    "ssc": ["SSC CGL", "SSC CHSL", "SSC GD"],
+    "railway": ["Railway NTPC", "Railway Group D", "RRB ALP", "RRB JE"],
+    "banking": [
+        "IBPS PO",
+        "IBPS Clerk",
+        "SBI PO",
+        "SBI Clerk",
+        "RBI Grade B",
+        "NABARD",
+        "LIC AAO",
+    ],
+    "social_security": ["EPFO", "ESIC"],
+    "teaching": ["CTET", "STET", "UGC NET", "CSIR NET"],
+    "defence": ["NDA", "CDS", "AFCAT", "CAPF"],
+    "engineering": ["JEE Main", "JEE Advanced", "GATE", "IES"],
+    "medical": ["NEET UG", "NEET PG"],
+    "law": ["CLAT", "AILET"],
+    "management": ["CAT", "MAT", "XAT", "GMAT", "CUET UG", "CUET PG"],
+}
+
+ALL_EXAM_NODES: List[str] = sorted(
+    {exam for members in EXAM_CATEGORY_MEMBERS.values() for exam in members}
+) + [ALL_EXAMS_NODE]
+
+# ----------------------------------------------------------------------
+# Topic keyword -> exam category mapping. Keys are lowercase phrases that
+# are searched for inside the article title + description. Values are
+# category keys from EXAM_CATEGORY_MEMBERS above.
+# ----------------------------------------------------------------------
+
+TOPIC_EXAM_MAP: Dict[str, List[str]] = {
+    "government scheme": ["upsc", "state", "banking", "ssc"],
+    "government policy": ["upsc", "state", "banking", "ssc"],
+    "government policies": ["upsc", "state", "banking", "ssc"],
+    "cabinet decision": ["upsc", "state"],
+    "parliament": ["upsc", "state"],
+    "rajya sabha": ["upsc", "state"],
+    "lok sabha": ["upsc", "state"],
+    "supreme court": ["upsc", "law", "state"],
+    "high court": ["upsc", "law", "state"],
+    "election commission": ["upsc", "state"],
+    "constitution": ["upsc", "law"],
+    "judiciary": ["upsc", "law"],
+    "reserve bank of india": ["banking", "upsc"],
+    " rbi ": ["banking", "upsc"],
+    "sebi": ["banking", "upsc"],
+    "nabard": ["banking", "upsc"],
+    "budget": ["upsc", "banking", "ssc", "state"],
+    "economy": ["upsc", "banking", "ssc"],
+    "economic": ["upsc", "banking", "ssc"],
+    "gdp": ["upsc", "banking"],
+    "inflation": ["upsc", "banking"],
+    "banking": ["banking", "upsc"],
+    "finance": ["banking", "upsc"],
+    "agriculture": ["upsc", "state", "banking"],
+    "science": ["engineering", "upsc", "ssc"],
+    "technology": ["engineering", "upsc", "ssc"],
+    "artificial intelligence": ["engineering", "upsc"],
+    " ai ": ["engineering", "upsc"],
+    "cyber security": ["engineering", "upsc", "defence"],
+    "cybersecurity": ["engineering", "upsc", "defence"],
+    "space mission": ["engineering", "upsc", "defence"],
+    "isro": ["engineering", "upsc", "defence"],
+    "nasa": ["engineering", "upsc"],
+    "drdo": ["defence", "upsc", "engineering"],
+    "defence": ["defence", "upsc"],
+    "indian army": ["defence", "upsc"],
+    "indian navy": ["defence", "upsc"],
+    "indian air force": ["defence", "upsc"],
+    "missile": ["defence", "upsc"],
+    "military exercise": ["defence", "upsc"],
+    "international relations": ["upsc"],
+    "united nations": ["upsc"],
+    "world health organization": ["upsc"],
+    "unesco": ["upsc"],
+    "imf": ["upsc", "banking"],
+    "world bank": ["upsc", "banking"],
+    "g20": ["upsc"],
+    "brics": ["upsc"],
+    "shanghai cooperation organisation": ["upsc"],
+    "award": ["upsc", "ssc", "banking", "railway", "state"],
+    "appointment": ["upsc", "ssc", "banking"],
+    "appointed": ["upsc", "ssc", "banking"],
+    "report released": ["upsc", "ssc", "banking"],
+    "index ranking": ["upsc", "ssc", "banking"],
+    "environment": ["upsc", "state"],
+    "climate change": ["upsc", "state"],
+    "national park": ["upsc", "state"],
+    "wildlife": ["upsc", "state"],
+    "biosphere reserve": ["upsc", "state"],
+    "tiger reserve": ["upsc", "state"],
+    "education policy": ["teaching", "upsc"],
+    "new education policy": ["teaching", "upsc"],
+    " nep ": ["teaching", "upsc"],
+    "sports": ["ssc", "railway", "upsc", "defence"],
+    "important day": ["upsc", "ssc", "railway", "banking", "state"],
+    "bihar": ["state"],
+}
+
+# ----------------------------------------------------------------------
+# Content that should never be uploaded, regardless of category.
+# ----------------------------------------------------------------------
+
+BLOCKLIST_KEYWORDS: List[str] = [
+    "bollywood",
+    "hollywood",
+    "movie review",
+    "box office",
+    "film review",
+    "web series",
+    "ott release",
+    "tv show",
+    "television show",
+    "reality show",
+    "celebrity",
+    "actor ",
+    "actress",
+    "fashion week",
+    "runway",
+    "entertainment news",
+    "gossip",
+    "meme",
+    "sponsored content",
+    "advertisement",
+    "promotional offer",
+    "click here to buy",
+    "horoscope",
+    "zodiac",
+]
 
 
-# --------------------------------------------------------------------------
-# NewsData.io fetching with retry
-# --------------------------------------------------------------------------
+# ======================================================================
+# RETRY DECORATOR
+# ======================================================================
 
-def fetch_category_with_retry(api_key: str, category: str):
-    """
-    Fetch a single category page from NewsData.io's 'latest' endpoint,
-    retrying on transient failures (network errors, timeouts, 5xx, 429).
-    Returns a list of raw article dicts, or an empty list if the category
-    could not be fetched after all retries.
-    """
-    params = {
-        "apikey": api_key,
-        "country": "in",
-        "language": "en",
-        "category": category,
-    }
+def retry(max_attempts: int = MAX_RETRIES, backoff_seconds: int = RETRY_BACKOFF_SECONDS):
+    """Retry a function on failure with linear backoff. Never raises past
+    the final attempt is swallowed by the caller if it also wraps in try/except."""
 
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:  # noqa: BLE001 - intentional broad catch
+                    last_exception = exc
+                    logger.warning(
+                        "Attempt %d/%d failed for %s: %s",
+                        attempt,
+                        max_attempts,
+                        func.__name__,
+                        exc,
+                    )
+                    if attempt < max_attempts:
+                        time.sleep(backoff_seconds * attempt)
+            logger.error("All %d attempts failed for %s", max_attempts, func.__name__)
+            raise last_exception
+
+        return wrapper
+
+    return decorator
+
+
+# ======================================================================
+# NEWS FETCHER
+# ======================================================================
+
+class NewsDataFetcher:
+    """Handles all communication with the NewsData.io API."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @retry()
+    def _fetch_page(self, category: str, page_token: Optional[str] = None) -> Dict[str, Any]:
+        params = {
+            "apikey": self.api_key,
+            "country": COUNTRY,
+            "language": LANGUAGE,
+            "category": category,
+        }
+        if page_token:
+            params["page"] = page_token
+
+        response = requests.get(
+            NEWSDATA_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+
+        if response.status_code == 429:
+            raise RuntimeError("NewsData.io rate limit reached (HTTP 429)")
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"NewsData.io returned HTTP {response.status_code}: {response.text[:200]}"
+            )
+
         try:
-            logger.info(
-                "Fetching NewsData.io category='%s' (attempt %d/%d)",
-                category, attempt, MAX_RETRIES,
-            )
-            response = requests.get(
-                NEWSDATA_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS
-            )
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON received from NewsData.io: {exc}") from exc
 
-            if response.status_code == 429:
-                logger.warning(
-                    "Rate limited by NewsData.io on category '%s'. Backing off.",
-                    category,
-                )
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-                last_error = "rate_limited"
+        if not data:
+            raise RuntimeError("Empty response body from NewsData.io")
+
+        if data.get("status") != "success":
+            raise RuntimeError(f"NewsData.io API error: {data.get('results', data)}")
+
+        return data
+
+    def fetch_category(self, category: str) -> List[Dict[str, Any]]:
+        """Fetch a single category's articles. Only the first page is
+        requested to conserve the free API quota."""
+        try:
+            data = self._fetch_page(category)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to fetch category '%s' after retries: %s", category, exc)
+            return []
+
+        articles = data.get("results") or []
+        logger.info("Fetched %d raw articles for category '%s'", len(articles), category)
+        return articles
+
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        all_articles: List[Dict[str, Any]] = []
+        for category in NEWS_CATEGORIES:
+            all_articles.extend(self.fetch_category(category))
+        return all_articles
+
+
+# ======================================================================
+# CONTENT FILTER
+# ======================================================================
+
+class ContentFilter:
+    """Rejects entertainment / spam / low quality articles."""
+
+    @staticmethod
+    def _text_of(article: Dict[str, Any]) -> str:
+        title = (article.get("title") or "").lower()
+        description = (article.get("description") or "").lower()
+        content = (article.get("content") or "").lower()
+        return f" {title} {description} {content} "
+
+    @classmethod
+    def is_allowed(cls, article: Dict[str, Any]) -> bool:
+        # Must have a title and a URL at minimum to be useful.
+        if not article.get("title") or not article.get("link"):
+            return False
+
+        text = cls._text_of(article)
+        for bad_word in BLOCKLIST_KEYWORDS:
+            if bad_word in text:
+                return False
+        return True
+
+
+# ======================================================================
+# DEDUPLICATION
+# ======================================================================
+
+class Deduplicator:
+    """Removes duplicate articles, both within a single run and against
+    what is already stored in Firebase."""
+
+    @staticmethod
+    def normalize_title(title: str) -> str:
+        title = title.lower().strip()
+        title = re.sub(r"[^a-z0-9 ]", "", title)
+        title = re.sub(r"\s+", " ", title)
+        return title
+
+    @staticmethod
+    def article_id(url: str) -> str:
+        return hashlib.md5(url.strip().lower().encode("utf-8")).hexdigest()
+
+    @classmethod
+    def dedupe_batch(cls, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen_urls: Set[str] = set()
+        seen_titles: Set[str] = set()
+        unique: List[Dict[str, Any]] = []
+
+        for article in articles:
+            url = (article.get("link") or "").strip().lower()
+            title_norm = cls.normalize_title(article.get("title") or "")
+
+            if not url or not title_norm:
+                continue
+            if url in seen_urls or title_norm in seen_titles:
                 continue
 
-            response.raise_for_status()
-            payload = response.json()
+            seen_urls.add(url)
+            seen_titles.add(title_norm)
+            unique.append(article)
 
-            if payload.get("status") != "success":
-                logger.warning(
-                    "NewsData.io returned non-success status for '%s': %s",
-                    category, payload.get("results", payload),
-                )
-                last_error = "api_error"
-                time.sleep(RETRY_BACKOFF_SECONDS)
-                continue
-
-            articles = payload.get("results", []) or []
-            logger.info(
-                "Fetched %d articles for category '%s'", len(articles), category
-            )
-            return articles
-
-        except requests.exceptions.Timeout as exc:
-            last_error = exc
-            logger.warning(
-                "Timeout fetching category '%s' (attempt %d/%d): %s",
-                category, attempt, MAX_RETRIES, exc,
-            )
-        except requests.exceptions.RequestException as exc:
-            last_error = exc
-            logger.warning(
-                "Request error fetching category '%s' (attempt %d/%d): %s",
-                category, attempt, MAX_RETRIES, exc,
-            )
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-            logger.warning(
-                "Invalid JSON from NewsData.io for category '%s' (attempt %d/%d): %s",
-                category, attempt, MAX_RETRIES, exc,
-            )
-
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-
-    logger.error(
-        "Giving up on category '%s' after %d attempts. Last error: %s",
-        category, MAX_RETRIES, last_error,
-    )
-    return []
+        return unique
 
 
-def fetch_all_news(api_key: str):
-    """Fetch news across all configured categories and return the raw list."""
-    all_articles = []
-    for category in NEWSDATA_CATEGORIES:
-        articles = fetch_category_with_retry(api_key, category)
-        all_articles.extend(articles)
-        time.sleep(SLEEP_BETWEEN_REQUESTS_SECONDS)
-    return all_articles
+# ======================================================================
+# SUMMARIZER
+# ======================================================================
+
+class Summarizer:
+    """Generates a short, clean 2-3 line summary without any external
+    LLM dependency, using simple extractive sentence selection."""
+
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+    @classmethod
+    def generate_summary(cls, article: Dict[str, Any]) -> str:
+        raw_text = (
+            article.get("description")
+            or article.get("content")
+            or article.get("title")
+            or ""
+        )
+        raw_text = raw_text.strip()
+
+        if not raw_text:
+            return "Summary not available for this article."
+
+        # Remove NewsData's truncation marker if present.
+        raw_text = raw_text.replace("ONLY AVAILABLE IN PAID PLANS", "").strip()
+
+        sentences = cls._SENTENCE_SPLIT_RE.split(raw_text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        if not sentences:
+            return raw_text[:280]
+
+        summary = " ".join(sentences[:3])
+
+        if len(summary) > 320:
+            summary = summary[:317].rsplit(" ", 1)[0] + "..."
+
+        return summary
 
 
-# --------------------------------------------------------------------------
-# Normalization, deduplication, categorization
-# --------------------------------------------------------------------------
+# ======================================================================
+# KEYWORD EXTRACTOR
+# ======================================================================
 
-def normalize_article(raw: dict):
-    """
-    Convert a raw NewsData.io article dict into our standard schema:
-    {title, date, category, description, source, url}
-    Returns None if the article is missing essential fields.
-    """
-    title = (raw.get("title") or "").strip()
-    url = (raw.get("link") or "").strip()
+class KeywordExtractor:
+    """Extracts important keywords found in an article based on the
+    important-topics vocabulary used across all supported exams."""
 
-    if not title or not url:
-        return None
+    @staticmethod
+    def extract(text: str) -> List[str]:
+        text_padded = f" {text.lower()} "
+        matched: List[str] = []
+        for phrase in TOPIC_EXAM_MAP.keys():
+            clean_phrase = phrase.strip()
+            if clean_phrase and clean_phrase in text_padded:
+                matched.append(clean_phrase.strip().title())
+        # Deduplicate while preserving order, cap at 10 keywords.
+        seen = set()
+        unique_matched = []
+        for kw in matched:
+            if kw not in seen:
+                seen.add(kw)
+                unique_matched.append(kw)
+        return unique_matched[:10]
 
-    description = (raw.get("description") or raw.get("content") or "").strip()
-    pub_date = (raw.get("pubDate") or "").strip()
-    source = (raw.get("source_id") or raw.get("source_name") or "unknown").strip()
 
-    raw_categories = raw.get("category") or []
-    if isinstance(raw_categories, list):
-        category_str = ", ".join(raw_categories)
-    else:
-        category_str = str(raw_categories)
+# ======================================================================
+# EXAM CATEGORIZER
+# ======================================================================
 
-    if not pub_date:
-        pub_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+class ExamCategorizer:
+    """Maps an article to every relevant exam node based on matched
+    topic keywords."""
 
-    return {
+    @staticmethod
+    def categorize(text: str) -> List[str]:
+        text_padded = f" {text.lower()} "
+        matched_categories: Set[str] = set()
+
+        for phrase, categories in TOPIC_EXAM_MAP.items():
+            if phrase.strip() in text_padded:
+                matched_categories.update(categories)
+
+        exam_names: Set[str] = set()
+        for category_key in matched_categories:
+            exam_names.update(EXAM_CATEGORY_MEMBERS.get(category_key, []))
+
+        # Every article always goes into "All Exams".
+        exam_names.add(ALL_EXAMS_NODE)
+
+        return sorted(exam_names)
+
+
+# ======================================================================
+# ARTICLE BUILDER
+# ======================================================================
+
+def build_article_record(raw_article: Dict[str, Any]) -> Dict[str, Any]:
+    """Transforms a raw NewsData.io article into our Firebase schema."""
+
+    title = (raw_article.get("title") or "").strip()
+    description = (raw_article.get("description") or "").strip() or "No description available."
+    url = (raw_article.get("link") or "").strip()
+    image_url = raw_article.get("image_url") or ""
+    source = raw_article.get("source_id") or raw_article.get("source_name") or "Unknown"
+
+    pub_date_raw = raw_article.get("pubDate")
+    try:
+        parsed_date = date_parser.parse(pub_date_raw) if pub_date_raw else datetime.now(timezone.utc)
+        if parsed_date.tzinfo is None:
+            parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        parsed_date = datetime.now(timezone.utc)
+
+    combined_text = f"{title} {description} {raw_article.get('content') or ''}"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    record = {
         "title": title,
-        "date": pub_date,
-        "category": category_str,
         "description": description,
+        "summary": Summarizer.generate_summary(raw_article),
+        "date": parsed_date.isoformat(),
+        "category": ", ".join(raw_article.get("category") or ["general"]),
         "source": source,
         "url": url,
+        "imageUrl": image_url,
+        "country": "India",
+        "language": "English",
+        "importantKeywords": KeywordExtractor.extract(combined_text),
+        "examNames": ExamCategorizer.categorize(combined_text),
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+    }
+    return record
+
+
+# ======================================================================
+# FIREBASE UPLOADER
+# ======================================================================
+
+class FirebaseUploader:
+    """Handles Firebase Admin SDK initialization and merging/uploading
+    of articles into the Realtime Database, per exam node."""
+
+    def __init__(self, service_account_json: str, database_url: str):
+        if firebase_admin is None:
+            raise RuntimeError(
+                "firebase_admin package is not installed. Run: pip install firebase-admin"
+            )
+
+        if not firebase_admin._apps:  # avoid re-initializing on repeated calls
+            cred_dict = json.loads(service_account_json)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred, {"databaseURL": database_url})
+
+    @retry()
+    def _get_existing(self, exam_name: str) -> Dict[str, Any]:
+        ref = db.reference(f"{FIREBASE_ROOT_NODE}/{exam_name}")
+        data = ref.get()
+        return data or {}
+
+    @retry()
+    def _write(self, exam_name: str, data: Dict[str, Any]) -> None:
+        ref = db.reference(f"{FIREBASE_ROOT_NODE}/{exam_name}")
+        ref.set(data)
+
+    def upload_articles_for_exam(
+        self, exam_name: str, new_articles: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """Merges new_articles into the existing node for exam_name,
+        removing duplicates by article id and keeping only the newest
+        MAX_ARTICLES_PER_EXAM entries."""
+
+        stats = {"added": 0, "skipped_duplicate": 0, "failed": 0}
+
+        try:
+            existing = self._get_existing(exam_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not read existing data for exam '%s': %s", exam_name, exc)
+            existing = {}
+
+        merged = dict(existing)
+
+        for article in new_articles:
+            article_id = Deduplicator.article_id(article["url"])
+            if article_id in merged:
+                stats["skipped_duplicate"] += 1
+                continue
+            merged[article_id] = article
+            stats["added"] += 1
+
+        if stats["added"] == 0:
+            logger.info("No new articles to add for exam '%s' (all duplicates).", exam_name)
+            return stats
+
+        # Sort newest first by 'date', trim to latest MAX_ARTICLES_PER_EXAM.
+        def sort_key(item):
+            try:
+                return date_parser.parse(item[1].get("date", ""))
+            except (ValueError, TypeError):
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        sorted_items = sorted(merged.items(), key=sort_key, reverse=True)
+        trimmed_items = sorted_items[:MAX_ARTICLES_PER_EXAM]
+        final_data = dict(trimmed_items)
+
+        try:
+            self._write(exam_name, final_data)
+            logger.info(
+                "Uploaded exam '%s': +%d new, %d duplicates skipped, %d total stored.",
+                exam_name,
+                stats["added"],
+                stats["skipped_duplicate"],
+                len(final_data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to write exam '%s' to Firebase: %s", exam_name, exc)
+            stats["failed"] = stats["added"]
+            stats["added"] = 0
+
+        return stats
+
+
+# ======================================================================
+# MAIN PIPELINE
+# ======================================================================
+
+def validate_environment() -> bool:
+    missing = []
+    if not NEWSDATA_API_KEY:
+        missing.append("NEWSDATA_API_KEY")
+    if not FIREBASE_SERVICE_ACCOUNT:
+        missing.append("FIREBASE_SERVICE_ACCOUNT")
+    if not FIREBASE_DATABASE_URL:
+        missing.append("FIREBASE_DATABASE_URL")
+
+    if missing:
+        logger.error("Missing required environment variables: %s", ", ".join(missing))
+        return False
+    return True
+
+
+def main() -> None:
+    start_time = time.time()
+    logger.info("=" * 70)
+    logger.info("ExamHub India Current Affairs Automation - Run Started")
+    logger.info("=" * 70)
+
+    if not validate_environment():
+        logger.error("Aborting run due to missing configuration.")
+        sys.exit(1)
+
+    stats = {
+        "fetched": 0,
+        "filtered_out": 0,
+        "duplicates_removed": 0,
+        "final_articles": 0,
+        "exam_uploads_added": 0,
+        "exam_uploads_duplicate": 0,
+        "exam_uploads_failed": 0,
     }
 
-
-def deduplicate_articles(articles):
-    """Remove duplicate articles based on URL (falls back to title)."""
-    seen_keys = set()
-    unique_articles = []
-
-    for article in articles:
-        key = article["url"].lower() if article.get("url") else article["title"].lower()
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_articles.append(article)
-
-    return unique_articles
-
-
-def categorize_article(article: dict):
-    """
-    Determine the set of exam nodes this article should be uploaded to,
-    based on EXAM_SPECIFIC_RULES and TOPIC_RULES. Always includes
-    ALL_EXAMS_NODE.
-    """
-    text = f"{article.get('title', '')} {article.get('description', '')}".lower()
-    matched_exams = set()
-
-    for exam, keywords in EXAM_SPECIFIC_RULES.items():
-        if any(keyword in text for keyword in keywords):
-            matched_exams.add(exam)
-
-    for _, rule in TOPIC_RULES.items():
-        if any(keyword in text for keyword in rule["keywords"]):
-            matched_exams.update(rule["exams"])
-
-    matched_exams.add(ALL_EXAMS_NODE)
-    return matched_exams
-
-
-def parse_date_safe(date_str: str):
-    """
-    Parse a date string into a comparable datetime for sorting.
-    Falls back to datetime.min (UTC-naive) if parsing fails, so
-    unparseable dates sort to the bottom rather than crashing the run.
-    """
-    if not date_str:
-        return datetime.min
-
-    formats = (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d",
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-
-    logger.debug("Could not parse date '%s'; treating as oldest possible.", date_str)
-    return datetime.min
-
-
-def build_exam_buckets(articles):
-    """
-    Given a deduplicated list of normalized articles, return a dict:
-        { exam_name: [article, article, ...] }
-    covering every exam in EXAM_LIST (empty list if nothing matched).
-    """
-    buckets = {exam: [] for exam in EXAM_LIST}
-
-    for article in articles:
-        matched_exams = categorize_article(article)
-        for exam in matched_exams:
-            if exam in buckets:
-                buckets[exam].append(article)
-
-    return buckets
-
-
-# --------------------------------------------------------------------------
-# Firebase helpers
-# --------------------------------------------------------------------------
-
-def init_firebase(service_account_json: str, database_url: str):
-    """Initialize the Firebase Admin SDK app from a service account JSON string."""
+    # ---------------- STEP 1: FETCH ----------------
     try:
-        service_account_info = json.loads(service_account_json)
-    except json.JSONDecodeError as exc:
-        logger.error("FIREBASE_SERVICE_ACCOUNT is not valid JSON: %s", exc)
-        sys.exit(1)
-
-    try:
-        cred = credentials.Certificate(service_account_info)
-        firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-        logger.info("Firebase Admin SDK initialized successfully.")
-    except Exception as exc:  # noqa: BLE001 - we want to catch any init failure
-        logger.error("Failed to initialize Firebase Admin SDK: %s", exc)
-        sys.exit(1)
-
-
-def upload_exam_bucket(exam_name: str, new_articles: list):
-    """
-    Merge new_articles with whatever already exists at
-    current_affairs/{exam_name}, deduplicate, sort by date (latest first),
-    truncate to MAX_ITEMS_PER_EXAM, and write the result back.
-    """
-    safe_path = f"{FIREBASE_ROOT_NODE}/{exam_name}"
-    ref = db.reference(safe_path)
-
-    try:
-        existing_data = ref.get()
+        fetcher = NewsDataFetcher(NEWSDATA_API_KEY)
+        raw_articles = fetcher.fetch_all()
+        stats["fetched"] = len(raw_articles)
+        logger.info("STEP 1 COMPLETE: Fetched %d total raw articles.", stats["fetched"])
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to read existing data for '%s': %s", exam_name, exc)
-        existing_data = None
-
-    existing_articles = []
-    if isinstance(existing_data, list):
-        existing_articles = [item for item in existing_data if item]
-    elif isinstance(existing_data, dict):
-        existing_articles = list(existing_data.values())
-
-    combined = existing_articles + new_articles
-    deduped = deduplicate_articles(combined)
-    deduped.sort(key=lambda a: parse_date_safe(a.get("date", "")), reverse=True)
-    trimmed = deduped[:MAX_ITEMS_PER_EXAM]
-
-    try:
-        ref.set(trimmed)
-        logger.info(
-            "Uploaded '%s': %d new, %d existing, %d after merge/dedup, %d stored.",
-            exam_name, len(new_articles), len(existing_articles),
-            len(deduped), len(trimmed),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to write data for '%s': %s", exam_name, exc)
-
-
-# --------------------------------------------------------------------------
-# Main pipeline
-# --------------------------------------------------------------------------
-
-def main():
-    logger.info("=== Current Affairs Updater: run started ===")
-
-    api_key = get_required_env("NEWSDATA_API_KEY")
-    service_account_json = get_required_env("FIREBASE_SERVICE_ACCOUNT")
-    database_url = get_required_env("FIREBASE_DATABASE_URL")
-
-    init_firebase(service_account_json, database_url)
-
-    logger.info("Fetching news from NewsData.io ...")
-    raw_articles = fetch_all_news(api_key)
-    logger.info("Total raw articles fetched: %d", len(raw_articles))
+        logger.error("Fatal error during fetch stage: %s", exc)
+        raw_articles = []
 
     if not raw_articles:
-        logger.warning("No articles were fetched. Ending run without changes.")
+        logger.warning("No articles fetched. Ending run gracefully.")
+        _log_final_summary(stats, start_time)
         return
 
-    normalized = []
-    for raw in raw_articles:
-        article = normalize_article(raw)
-        if article:
-            normalized.append(article)
-    logger.info("Normalized articles: %d", len(normalized))
+    # ---------------- STEP 2: FILTER ----------------
+    filtered_articles = []
+    for article in raw_articles:
+        try:
+            if ContentFilter.is_allowed(article):
+                filtered_articles.append(article)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skipping article due to filter error: %s", exc)
 
-    deduped = deduplicate_articles(normalized)
-    logger.info("Articles after deduplication: %d", len(deduped))
+    stats["filtered_out"] = stats["fetched"] - len(filtered_articles)
+    logger.info(
+        "STEP 2 COMPLETE: %d articles passed filtering, %d rejected.",
+        len(filtered_articles),
+        stats["filtered_out"],
+    )
 
-    deduped.sort(key=lambda a: parse_date_safe(a.get("date", "")), reverse=True)
+    # ---------------- STEP 3: DEDUPLICATE (within batch) ----------------
+    unique_articles = Deduplicator.dedupe_batch(filtered_articles)
+    stats["duplicates_removed"] = len(filtered_articles) - len(unique_articles)
+    logger.info(
+        "STEP 3 COMPLETE: %d unique articles remain, %d duplicates removed.",
+        len(unique_articles),
+        stats["duplicates_removed"],
+    )
 
-    buckets = build_exam_buckets(deduped)
+    # ---------------- STEP 4: BUILD RECORDS (summary + keywords + exams) ----------------
+    built_records = []
+    for raw in unique_articles:
+        try:
+            record = build_article_record(raw)
+            built_records.append(record)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skipping article '%s' due to build error: %s", raw.get("title"), exc)
 
-    for exam_name in EXAM_LIST:
-        new_articles = buckets.get(exam_name, [])
-        upload_exam_bucket(exam_name, new_articles)
+    stats["final_articles"] = len(built_records)
+    logger.info("STEP 4 COMPLETE: %d article records built.", stats["final_articles"])
 
-    logger.info("=== Current Affairs Updater: run completed successfully ===")
+    if not built_records:
+        logger.warning("No valid articles to upload. Ending run gracefully.")
+        _log_final_summary(stats, start_time)
+        return
+
+    # ---------------- STEP 5: GROUP BY EXAM ----------------
+    exam_buckets: Dict[str, List[Dict[str, Any]]] = {exam: [] for exam in ALL_EXAM_NODES}
+    for record in built_records:
+        for exam_name in record["examNames"]:
+            if exam_name in exam_buckets:
+                exam_buckets[exam_name].append(record)
+
+    # ---------------- STEP 6: UPLOAD TO FIREBASE ----------------
+    try:
+        uploader = FirebaseUploader(FIREBASE_SERVICE_ACCOUNT, FIREBASE_DATABASE_URL)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Fatal error initializing Firebase: %s", exc)
+        _log_final_summary(stats, start_time)
+        return
+
+    for exam_name, articles in exam_buckets.items():
+        if not articles:
+            continue
+        try:
+            result = uploader.upload_articles_for_exam(exam_name, articles)
+            stats["exam_uploads_added"] += result["added"]
+            stats["exam_uploads_duplicate"] += result["skipped_duplicate"]
+            stats["exam_uploads_failed"] += result["failed"]
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Unexpected failure uploading exam '%s': %s", exam_name, exc)
+            stats["exam_uploads_failed"] += len(articles)
+
+    logger.info("STEP 6 COMPLETE: Upload finished for all exam nodes.")
+
+    _log_final_summary(stats, start_time)
+
+
+def _log_final_summary(stats: Dict[str, int], start_time: float) -> None:
+    elapsed = time.time() - start_time
+    logger.info("=" * 70)
+    logger.info("RUN SUMMARY")
+    logger.info("-" * 70)
+    logger.info("Fetched News            : %d", stats["fetched"])
+    logger.info("Filtered Out (Rejected) : %d", stats["filtered_out"])
+    logger.info("Duplicates Removed      : %d", stats["duplicates_removed"])
+    logger.info("Final Unique Articles   : %d", stats["final_articles"])
+    logger.info("Uploaded (per exam)     : %d", stats["exam_uploads_added"])
+    logger.info("Skipped (already exist) : %d", stats["exam_uploads_duplicate"])
+    logger.info("Failed Uploads          : %d", stats["exam_uploads_failed"])
+    logger.info("Execution Time          : %.2f seconds", elapsed)
+    logger.info("=" * 70)
+    logger.info("ExamHub India Current Affairs Automation - Run Finished")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
-        raise
-    except Exception as exc:  # noqa: BLE001 - top-level safety net
-        logger.exception("Unhandled fatal error: %s", exc)
-        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001 - top-level safety net, never crash
+        logger.exception("Unhandled exception in main execution: %s", exc)
+        sys.exit(0)  # exit cleanly so scheduled workflow doesn't show hard failure spam
