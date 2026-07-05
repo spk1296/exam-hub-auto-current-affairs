@@ -945,7 +945,13 @@ class ExamCategorizer:
 # ======================================================================
 
 def build_article_record(raw_article: Dict[str, Any]) -> Dict[str, Any]:
-    """Transforms a raw NewsData.io article into our Firebase schema."""
+    """Transforms a raw NewsData.io article into our Firebase schema.
+
+    Adds date / month / year split fields plus a unix timestamp so:
+    - the FirebaseUploader can file the article into its own
+      Year -> Month -> Date archive folder, and
+    - the app can sort articles newest-first using the timestamp.
+    """
 
     title = (raw_article.get("title") or "").strip()
     description = (raw_article.get("description") or "").strip() or "No description available."
@@ -958,6 +964,8 @@ def build_article_record(raw_article: Dict[str, Any]) -> Dict[str, Any]:
         parsed_date = date_parser.parse(pub_date_raw) if pub_date_raw else datetime.now(timezone.utc)
         if parsed_date.tzinfo is None:
             parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+        else:
+            parsed_date = parsed_date.astimezone(timezone.utc)
     except (ValueError, TypeError):
         parsed_date = datetime.now(timezone.utc)
 
@@ -965,11 +973,22 @@ def build_article_record(raw_article: Dict[str, Any]) -> Dict[str, Any]:
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # Date fields used by FirebaseUploader to build the
+    # Year/Month/Date archive path, and by the app for sorting.
+    date_str = parsed_date.strftime("%Y-%m-%d")
+    month_str = parsed_date.strftime("%m")
+    year_str = parsed_date.strftime("%Y")
+    timestamp = int(parsed_date.timestamp())
+
     record = {
         "title": title,
         "description": description,
         "summary": Summarizer.generate_summary(raw_article),
-        "date": parsed_date.isoformat(),
+        "publishedAt": parsed_date.isoformat(),  # full ISO timestamp, kept for reference
+        "date": date_str,     # e.g. "2026-07-06"
+        "month": month_str,   # e.g. "07"
+        "year": year_str,     # e.g. "2026"
+        "timestamp": timestamp,  # unix seconds, for newest-first sorting
         "category": ", ".join(raw_article.get("category") or ["general"]),
         "source": source,
         "url": url,
@@ -989,8 +1008,29 @@ def build_article_record(raw_article: Dict[str, Any]) -> Dict[str, Any]:
 # ======================================================================
 
 class FirebaseUploader:
-    """Handles Firebase Admin SDK initialization and merging/uploading
-    of articles into the Realtime Database, per exam node."""
+    """Handles Firebase Admin SDK initialization and permanent archiving
+    of articles into the Realtime Database.
+
+    Storage layout (per exam):
+
+        current_affairs/{exam_name}/{year}/{month}/{date}/{article_id}
+
+    Example:
+
+        current_affairs/UPSC/2026/07/2026-07-06/<article_id>
+
+    Design rules:
+    - Nothing is EVER deleted or trimmed. Every day's folder is
+      permanent, so old current affairs stay available for monthly /
+      yearly revision.
+    - Duplicate checking only looks at the SAME date's existing
+      articles, never the exam's whole history, since re-fetching an
+      old article that already exists under a past date is fine (each
+      date is its own independent bucket).
+    - Writes use Firebase's update(), and only send the newly added
+      article keys for that date -- existing days, and existing
+      articles within today's day, are never re-written.
+    """
 
     def __init__(self, service_account_json: str, database_url: str):
         if firebase_admin is None:
@@ -1003,122 +1043,102 @@ class FirebaseUploader:
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
+    @staticmethod
+    def _day_path(exam_name: str, year: str, month: str, date_str: str) -> str:
+        return f"{FIREBASE_ROOT_NODE}/{exam_name}/{year}/{month}/{date_str}"
+
     @retry()
-    def _get_existing(self, exam_name: str) -> Dict[str, Any]:
-        ref = db.reference(f"{FIREBASE_ROOT_NODE}/{exam_name}")
+    def _get_existing_day(
+        self, exam_name: str, year: str, month: str, date_str: str
+    ) -> Dict[str, Any]:
+        """Reads only today's (or whichever date's) existing folder --
+        never the exam's full history -- so this stays fast even after
+        a year of daily archives have piled up."""
+        ref = db.reference(self._day_path(exam_name, year, month, date_str))
         data = ref.get()
         return data or {}
 
     @retry()
-    def _write(self, exam_name: str, data: Dict[str, Any]) -> None:
-        ref = db.reference(f"{FIREBASE_ROOT_NODE}/{exam_name}")
-        ref.set(data)
+    def _update_day(
+        self, exam_name: str, year: str, month: str, date_str: str, new_entries: Dict[str, Any]
+    ) -> None:
+        """update() only writes the given article keys; it never
+        touches, overwrites, or deletes anything else already stored
+        under this date, or any other date/month/year folder."""
+        ref = db.reference(self._day_path(exam_name, year, month, date_str))
+        ref.update(new_entries)
 
     def upload_articles_for_exam(
         self, exam_name: str, new_articles: List[Dict[str, Any]]
     ) -> Dict[str, int]:
-        """Merges new_articles into the existing node for exam_name,
-        removing duplicates by article id and keeping only the newest
-        MAX_ARTICLES_PER_EXAM entries."""
+        """Archives new_articles for exam_name under their own
+        Year/Month/Date folder. All articles are kept forever -- there
+        is no limit on how many are stored and nothing is ever trimmed."""
 
         stats = {"added": 0, "skipped_duplicate": 0, "failed": 0}
 
-        try:
-            existing = self._get_existing(exam_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Could not read existing data for exam '%s': %s", exam_name, exc)
-            existing = {}
-
-        # Firebase se purana data read hua
-        # Agar list format me hai to dict me convert kar do
-
-        if existing is None:
-            merged = {}
-
-        elif isinstance(existing, dict):
-            merged = existing.copy()
-
-        elif isinstance(existing, list):
-            merged = {}
-
-            for item in existing:
-                if not item:
-                    continue
-
-                if isinstance(item, dict) and "url" in item:
-                    article_id = Deduplicator.article_id(item["url"])
-                    merged[article_id] = item
-
-        else:
-            merged = {}
-
-        # Numeric key dict ko article-id dict me convert karo
-        normalized = {}
-
-        for key, value in merged.items():
-            if isinstance(value, dict) and value.get("url"):
-                article_id = Deduplicator.article_id(value["url"])
-                normalized[article_id] = value
-
-        merged = normalized
-
+        # Group today's articles by (year, month, date) -- normally
+        # this is a single bucket, but grouping keeps this correct even
+        # if a run happens to contain articles with different publish
+        # dates.
+        by_day: Dict[tuple, List[Dict[str, Any]]] = {}
         for article in new_articles:
-            try:
-                article_id = Deduplicator.article_id(article["url"])
-            except Exception:
+            year = article.get("year")
+            month = article.get("month")
+            date_str = article.get("date")
+            if not (year and month and date_str):
                 continue
-            if article_id in merged:
-                stats["skipped_duplicate"] += 1
+            by_day.setdefault((year, month, date_str), []).append(article)
+
+        for (year, month, date_str), day_articles in by_day.items():
+            try:
+                existing_day = self._get_existing_day(exam_name, year, month, date_str)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Could not read existing archive for exam '%s' on %s: %s",
+                    exam_name, date_str, exc,
+                )
+                existing_day = {}
+
+            existing_ids: Set[str] = set(existing_day.keys()) if isinstance(existing_day, dict) else set()
+
+            # Duplicate check is scoped to THIS date only, as required --
+            # the same article appearing under a different date is fine.
+            new_entries: Dict[str, Any] = {}
+            for article in day_articles:
+                try:
+                    article_id = Deduplicator.article_id(article["url"])
+                except Exception:
+                    continue
+                if article_id in existing_ids or article_id in new_entries:
+                    stats["skipped_duplicate"] += 1
+                    continue
+                new_entries[article_id] = article
+                stats["added"] += 1
+
+            if not new_entries:
+                logger.info(
+                    "No new articles to add for exam '%s' on %s (all duplicates).",
+                    exam_name, date_str,
+                )
                 continue
-            merged[article_id] = article
-            stats["added"] += 1
-
-        if stats["added"] == 0:
-            logger.info("No new articles to add for exam '%s' (all duplicates).", exam_name)
-            return stats
-
-        # Sort newest first by 'date', trim to latest MAX_ARTICLES_PER_EXAM.
-        def sort_key(item):
-            date_value = item[1].get("date")
-
-            if not date_value:
-                return datetime.min.replace(tzinfo=timezone.utc)
 
             try:
-                dt = date_parser.parse(date_value)
-
-                # Make every datetime timezone-aware (UTC)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    dt = dt.astimezone(timezone.utc)
-
-                return dt
-
-            except Exception:
-                return datetime.min.replace(tzinfo=timezone.utc)
-
-        sorted_items = sorted(merged.items(), key=sort_key, reverse=True)
-        trimmed_items = sorted_items[:MAX_ARTICLES_PER_EXAM]
-        final_data = dict(trimmed_items)
-
-        # Firebase me hamesha Dictionary format save hoga
-        if not isinstance(final_data, dict):
-            final_data = dict(final_data)
-
-        try:
-            self._write(exam_name, final_data)
-            logger.info(
-                "Uploaded exam '%s': +%d new, %d duplicates skipped, %d total stored.",
-                exam_name,
-                stats["added"],
-                stats["skipped_duplicate"],
-                len(final_data),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to write exam '%s' to Firebase: %s", exam_name, exc)
-            stats["failed"] = stats["added"]
-            stats["added"] = 0
+                self._update_day(exam_name, year, month, date_str, new_entries)
+                logger.info(
+                    "Archived exam '%s' on %s: +%d new articles (%d total that day).",
+                    exam_name,
+                    date_str,
+                    len(new_entries),
+                    len(existing_ids) + len(new_entries),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to write exam '%s' on %s to Firebase: %s",
+                    exam_name, date_str, exc,
+                )
+                stats["failed"] += len(new_entries)
+                stats["added"] -= len(new_entries)
 
         return stats
 
