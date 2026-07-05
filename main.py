@@ -573,10 +573,44 @@ class FirebaseUploader:
             logger.error("Could not read existing data for exam '%s': %s", exam_name, exc)
             existing = {}
 
-        merged = dict(existing)
+        # Firebase se purana data read hua
+        # Agar list format me hai to dict me convert kar do
+
+        if existing is None:
+            merged = {}
+
+        elif isinstance(existing, dict):
+            merged = existing.copy()
+
+        elif isinstance(existing, list):
+            merged = {}
+
+            for item in existing:
+                if not item:
+                    continue
+
+                if isinstance(item, dict) and "url" in item:
+                    article_id = Deduplicator.article_id(item["url"])
+                    merged[article_id] = item
+
+        else:
+            merged = {}
+
+        # Numeric key dict ko article-id dict me convert karo
+        normalized = {}
+
+        for key, value in merged.items():
+            if isinstance(value, dict) and value.get("url"):
+                article_id = Deduplicator.article_id(value["url"])
+                normalized[article_id] = value
+
+        merged = normalized
 
         for article in new_articles:
-            article_id = Deduplicator.article_id(article["url"])
+            try:
+                article_id = Deduplicator.article_id(article["url"])
+            except Exception:
+                continue
             if article_id in merged:
                 stats["skipped_duplicate"] += 1
                 continue
@@ -589,14 +623,23 @@ class FirebaseUploader:
 
         # Sort newest first by 'date', trim to latest MAX_ARTICLES_PER_EXAM.
         def sort_key(item):
+            date_value = item[1].get("date")
+
+            if not date_value:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
             try:
-                return date_parser.parse(item[1].get("date", ""))
-            except (ValueError, TypeError):
+                return date_parser.parse(date_value)
+            except Exception:
                 return datetime.min.replace(tzinfo=timezone.utc)
 
         sorted_items = sorted(merged.items(), key=sort_key, reverse=True)
         trimmed_items = sorted_items[:MAX_ARTICLES_PER_EXAM]
         final_data = dict(trimmed_items)
+
+        # Firebase me hamesha Dictionary format save hoga
+        if not isinstance(final_data, dict):
+            final_data = dict(final_data)
 
         try:
             self._write(exam_name, final_data)
