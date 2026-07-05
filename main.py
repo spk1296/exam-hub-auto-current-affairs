@@ -304,15 +304,29 @@ class NewsDataFetcher:
         return data
 
     def fetch_category(self, category: str) -> List[Dict[str, Any]]:
-        """Fetch a single category's articles. Only the first page is
-        requested to conserve the free API quota."""
-        try:
-            data = self._fetch_page(category)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to fetch category '%s' after retries: %s", category, exc)
-            return []
+        """Fetch a category's articles across multiple pages (up to 300
+        articles) using NewsData.io's nextPage cursor, stopping early if
+        results run out or no further page is available."""
+        articles: List[Dict[str, Any]] = []
+        page = None
 
-        articles = data.get("results") or []
+        while len(articles) < 300:
+            try:
+                data = self._fetch_page(category, page)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to fetch category '%s' after retries: %s", category, exc)
+                break
+
+            results = data.get("results") or []
+            if not results:
+                break
+
+            articles.extend(results)
+
+            page = data.get("nextPage")
+            if not page:
+                break
+
         logger.info("Fetched %d raw articles for category '%s'", len(articles), category)
         return articles
 
