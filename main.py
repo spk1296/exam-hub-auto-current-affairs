@@ -629,7 +629,16 @@ class FirebaseUploader:
                 return datetime.min.replace(tzinfo=timezone.utc)
 
             try:
-                return date_parser.parse(date_value)
+                dt = date_parser.parse(date_value)
+
+                # Make every datetime timezone-aware (UTC)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+
+                return dt
+
             except Exception:
                 return datetime.min.replace(tzinfo=timezone.utc)
 
