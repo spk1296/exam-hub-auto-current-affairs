@@ -2,15 +2,17 @@ name: Update Current Affairs
 
 on:
   schedule:
-    # Runs every day at 02:00 UTC (07:30 AM IST)
-    - cron: "0 2 * * *"
-  workflow_dispatch: {}
+    # Runs every day at 01:00 UTC (06:30 AM IST)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    # Allows manual triggering from the GitHub Actions tab
 
 permissions:
   contents: read
 
 jobs:
   update-current-affairs:
+    name: Fetch, Process and Upload Current Affairs
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -18,7 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -28,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Current Affairs updater
+      - name: Run current affairs automation
         env:
           NEWSDATA_API_KEY: ${{ secrets.NEWSDATA_API_KEY }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
